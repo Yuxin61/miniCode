@@ -29,8 +29,11 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = dedent(f"""
     You are a coding agent at {os.getcwd()}. 
-    Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
-    Prefer tools over prose. Act, don't explain.
+    Use the task tool to delegate exploration or subtasks.
+""")
+SUBAGENT_SYSTEM = dedent(f"""
+    You are a coding agent at {os.getcwd()}.
+    Complete the given task, then summarize your findings.
 """)
 
 
@@ -142,7 +145,7 @@ TOOL_HANDLERS = {
 }
 
 
-TOOLS = [
+CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {
         "type": "object",
@@ -175,13 +178,45 @@ TOOLS = [
     }},
 ]
 
+PARENT_TOOLS = CHILD_TOOLS + [
+    {"name": "task", "description": "Spwan a subagent with fresh context. It shares the filesystem but not conversation history.",
+     "input_schema": {
+         "type": "object", 
+         "properties": {"prompt": {"type": "string"}, "desription": {"type": "string", "description": "Short description of the task"}},
+         "required": ["prompt"]
+    }},
+]
+
+
+# -- Subagent: fresh context, filtered tools, summary-only return --
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]
+    for _ in range(30): # safety limit
+        response = client.messages.create(
+            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
+            tools=CHILD_TOOLS, max_tokens=8000,
+        )
+        sub_messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = TOOL_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+        sub_messages.append({"role": "user", "content": safe_content(results)})
+    # Only the final text returns to the parent -- child context is discarded
+    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+
 
 def agent_loop(messages: list):
+    round_since_todo = 0
     while True:
         # Nag reminder is injected below, alongside tool results
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+            tools=PARENT_TOOLS, max_tokens=8000,
         )
         # Append assistant turn
         messages.append({"role": "assistant", "content": safe_content(response.content)})
@@ -191,15 +226,18 @@ def agent_loop(messages: list):
         # Execute each tool call, collect results
         results = []
         used_todo = False
-        round_since_todo = 0
         for block in response.content:
             if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                print(f"*** {block.name} - {block.input}")
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
+                if block.name == "task":
+                    desc = block.input.get("description", "subtask")
+                    print(f"* task ({desc}): {block.input['prompt'][:80]}")
+                    output = run_subagent(block.input["prompt"])
+                else:
+                    handler = TOOL_HANDLERS.get(block.name)
+                    try:
+                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    except Exception as e:
+                        output = f"Error: {e}"
                 print(f"* {block.name}\n{output[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
                 if block.name == "todo":
