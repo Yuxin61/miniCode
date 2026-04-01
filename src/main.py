@@ -191,7 +191,7 @@ TODO = TodoManager()
 SYSTEM = dedent(f"""
     You are a coding agent at {WORKDIR}.
     Use load_skill to access specialized knowledge before tackling unfamiliar topics.
-    Use the task tool to delegate exploration or subtasks.
+    Use the subagent tool to delegate exploration or subtasks.
 
     Skills available:
     {SKILL_LOADER.get_descriptions()}
@@ -315,7 +315,7 @@ CHILD_TOOLS = [
 ]
 
 PARENT_TOOLS = CHILD_TOOLS + [
-    {"name": "task", "description": "Spwan a subagent with fresh context. It shares the filesystem but not conversation history.",
+    {"name": "subagent", "description": "Spwan a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {
          "type": "object", 
          "properties": {"prompt": {"type": "string"}, "desription": {"type": "string", "description": "Short description of the task"}},
@@ -376,9 +376,9 @@ def agent_loop(messages: list):
         manual_compact = False
         for block in response.content:
             if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subtask")
-                    print(f"* task ({desc}): {block.input['prompt'][:80]}")
+                if block.name == "subagent":
+                    desc = block.input.get("description", "subagent")
+                    print(f"* subagent ({desc}): {block.input['prompt'][:80]}")
                     output = run_subagent(block.input["prompt"])
                 elif block.name == "compact":
                     manual_compact = True
