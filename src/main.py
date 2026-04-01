@@ -1,6 +1,8 @@
 import os
 import re
 import subprocess
+import time
+import json
 from textwrap import dedent
 from pathlib import Path
 from pprint import pprint
@@ -28,6 +30,71 @@ client = Anthropic(
 )
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / ".minicode" / "skills"
+THRESHOLD = 10000
+TRANSCRIPT_DIR = WORKDIR / ".minicode" / "transcripts"
+KEEP_RECENT = 3
+
+
+def estimate_tokens(messages: list) -> int:
+    """Rough token count: ~4 chars per token."""
+    return len(str(messages)) // 4
+
+
+# -- Layer 1: micro_compact - replace old tool results with placeholders --
+def micro_compact(messages: list) -> list:
+    # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
+    tool_results = []
+    for msg_idx, msg in enumerate(messages):
+        if msg["role"] == "user" and isinstance(msg.get("content"), list):
+            for part_idx, part in enumerate(msg["content"]):
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    tool_results.append((msg_idx, part_idx, part))
+    if len(tool_results) <= KEEP_RECENT:
+        return messages
+    # Find tool_name for each result by matching tool_use_id in prior assistant messages
+    tool_name_map = {}
+    for msg in messages:
+        if msg["role"] == "assistant":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if hasattr(block, "type") and block.type == "tool_use":
+                        tool_name_map[block.id] = block.name
+    # Clear old results (keep at least KEEP_RECENT)
+    to_clear = tool_results[:-KEEP_RECENT]
+    for _, _, result in to_clear:
+        if isinstance(result.get("content"), str) and len(result["content"]) > 100:
+            tool_id = result.get("tool_use_id", "")
+            tool_name = tool_name_map.get(tool_id, "unknown")
+            result["content"] = f"[Previous: used {tool_name}]"
+    return messages
+
+
+# -- Layer 2: auto_compact - save transcript, summarize, replace messages --
+def auto_compact(messages: list) -> list:
+    # Save full transcript to disk
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(transcript_path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
+    # Ask LLM to summarize
+    coversation_text = json.dumps(messages, default=str, ensure_ascii=False)[:80000]
+    response = client.messages.create(
+        model=MODEL,
+        messages=[{"role": "user", "content":
+                   "Summarize this conversation for continuity. Include: "
+                   "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+                   "Be concise but preserve critical details.\n\n" + coversation_text}],
+        max_tokens=2000,
+    )
+    summary = response.content[0].text
+    # Replace all messages with compressed summary
+    return [
+        {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
+        {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
+    ]
 
 
 class SkillLoader:
@@ -204,6 +271,7 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo":       lambda **kw: TODO.update(kw["items"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "compact":    lambda **kw: "Manual compression requested.",
 }
 
 
@@ -253,6 +321,11 @@ PARENT_TOOLS = CHILD_TOOLS + [
          "properties": {"prompt": {"type": "string"}, "desription": {"type": "string", "description": "Short description of the task"}},
          "required": ["prompt"]
     }},
+    {"name": "compact", "description": "Trigger manual conversation compression.",
+     "input_schema": {
+         "type": "object",
+         "properties": {"focus": {"type": "string", "description": "What to preserve in the summary"}}
+    }},
 ]
 
 
@@ -281,6 +354,12 @@ def run_subagent(prompt: str) -> str:
 def agent_loop(messages: list):
     round_since_todo = 0
     while True:
+        # Layer 1: micro_compact before each LLM call
+        micro_compact(messages)
+        # Layer 2: auto_compact if token estimate exceeds threshold
+        if estimate_tokens(messages) > THRESHOLD:
+            print("[auto_compact triggered]")
+            messages[:] = auto_compact(messages)
         # Nag reminder is injected below, alongside tool results
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -294,12 +373,16 @@ def agent_loop(messages: list):
         # Execute each tool call, collect results
         results = []
         used_todo = False
+        manual_compact = False
         for block in response.content:
             if block.type == "tool_use":
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
                     print(f"* task ({desc}): {block.input['prompt'][:80]}")
                     output = run_subagent(block.input["prompt"])
+                elif block.name == "compact":
+                    manual_compact = True
+                    output = "Compressing..."
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
                     try:
@@ -314,6 +397,10 @@ def agent_loop(messages: list):
         if round_since_todo >= 3:
             results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": safe_content(results)})
+        # Layer 3: manual compact triggered by the compact tool
+        if manual_compact:
+            print("[manual compact]")
+            messages[:] = auto_compact(messages)
 
 if __name__ == "__main__":
     history = []

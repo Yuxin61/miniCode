@@ -8,11 +8,11 @@ This project is an implementation of https://learn.shareai.run/.
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
-Python                           1             42             22            270
-Markdown                         1             50              0            174
+Python                           1             48             34            339
+Markdown                         1             55              0            207
 TOML                             1              0              0             10
 -------------------------------------------------------------------------------
-SUM:                             3             92             22            454
+SUM:                             3            103             34            556
 -------------------------------------------------------------------------------
 ```
 
@@ -184,6 +184,38 @@ skills/
 6. Task (subagent, only parent)
 7. \*Skill
 
+### s06: Compact
+
+Context will fill up; three-layer compression strategy enables infinite sessions.
+
+```
+    Every turn:
+    +------------------+
+    | Tool call result |
+    +------------------+
+            |
+            v
+    [Layer 1: micro_compact]        (silent, every turn)
+      Replace tool_result content older than last 3
+      with "[Previous: used {tool_name}]"
+            |
+            v
+    [Check: tokens > 50000?]
+       |               |
+       no              yes
+       |               |
+       v               v
+    continue    [Layer 2: auto_compact]
+                  Save full transcript to .transcripts/
+                  Ask LLM to summarize conversation.
+                  Replace all messages with [summary].
+                        |
+                        v
+                [Layer 3: compact tool]
+                  Model calls compact -> immediate summarization.
+                  Same as auto, triggered manually.
+```
+
 ## Tests
 
 **s01**
@@ -218,6 +250,12 @@ skills/
 2. Load the agent-builder skill and follow its instructions
 3. I need to create a mcp server -- load the relevant skill first
 4. Build an MCP server using the mcp-builder skill
+
+**s06**
+
+1. Read every Python file in the src/ directory one by one (Observe micro-compact replacing old results)
+2. Keep reading files until compression triggers automatically
+3. Use the compact tool to manually compress the conversation
 
 ## Explorer
 
