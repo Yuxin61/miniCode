@@ -8,11 +8,11 @@ This project is an implementation of https://learn.shareai.run/.
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
-Python                           1             24              6            135
-Markdown                         1             20              0             60
+Python                           1             42             22            270
+Markdown                         1             50              0            174
 TOML                             1              0              0             10
 -------------------------------------------------------------------------------
-SUM:                             3             44              6            205
+SUM:                             3             92             22            454
 -------------------------------------------------------------------------------
 ```
 
@@ -140,6 +140,50 @@ Spawn a child agent with fresh `messages=[]`. The child works in its own context
 5. Todo
 6. \*Task (subagent, only parent)
 
+### s05: Skills
+
+Two-layer skill injection that avoids bloating the system prompt:
+
+- Layer 1 (cheap): skill names in system prompt (~100 tokens/skill)
+- Layer 2 (on demand): full skill body in tool_result
+
+```
+skills/
+    pdf/
+    SKILL.md          <-- frontmatter (name, description) + body
+    code-review/
+    SKILL.md
+```
+
+```
+    System prompt:
+    +--------------------------------------+
+    | You are a coding agent.              |
+    | Skills available:                    |
+    |   - pdf: Process PDF files...        |  <-- Layer 1: metadata only
+    |   - code-review: Review code...      |
+    +--------------------------------------+
+    When model calls load_skill("pdf"):
+    +--------------------------------------+
+    | tool_result:                         |
+    | <skill>                              |
+    |   Full PDF processing instructions   |  <-- Layer 2: full body
+    |   Step 1: ...                        |
+    |   Step 2: ...                        |
+    | </skill>                             |
+    +--------------------------------------+
+```
+
+**Tools**
+
+1. Bash
+2. Read File
+3. Write File
+4. Edit File
+5. Todo
+6. Task (subagent, only parent)
+7. \*Skill
+
 ## Tests
 
 **s01**
@@ -167,3 +211,14 @@ Spawn a child agent with fresh `messages=[]`. The child works in its own context
 1. Use a subtask to find what third-libraries this project uses
 2. Delegate: read all `.py` files and summarize what each one does
 3. Use a task to create a new module, then verify it from here
+
+**s05**
+
+1. What skills are available?
+2. Load the agent-builder skill and follow its instructions
+3. I need to create a mcp server -- load the relevant skill first
+4. Build an MCP server using the mcp-builder skill
+
+## Explorer
+
+TODO.
