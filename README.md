@@ -8,11 +8,11 @@ This project is an implementation of https://learn.shareai.run/.
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
-Python                           1             63             52            508
-Markdown                         1             76              0            259
+Python                           1             86             57            726
+Markdown                         1             91              0            298
 TOML                             1              0              0             10
 -------------------------------------------------------------------------------
-SUM:                             3            139             52            777
+SUM:                             3            177             57           1034
 -------------------------------------------------------------------------------
 ```
 
@@ -54,7 +54,7 @@ This is the core loop: feed tool results back to the model until the model decid
 
 **Tools**
 
-- Bash
+1. Bash
 
 ### s02: Tool Use
 
@@ -76,10 +76,9 @@ Key insight: "The loop didn't change at all. I just added tools."
 
 **Tools**
 
-1. Bash
-2. \*Read File
-3. \*Write File
-4. \*Edit File
+2. Read File
+3. Write File
+4. Edit File
 
 ### s03: Todo List
 
@@ -110,11 +109,7 @@ Key insight: "The agent can track its own progress -- and I can see it."
 
 **Tools**
 
-1. Bash
-2. Read File
-3. Write File
-4. Edit File
-5. \*Todo
+5. Todo
 
 ### s04: Subagent
 
@@ -140,12 +135,7 @@ Key insight: "Process isolation gives context isolation for free."
 
 **Tools**
 
-1. Bash
-2. Read File
-3. Write File
-4. Edit File
-5. Todo
-6. \*Task (subagent, only parent)
+6. Task (subagent, only parent)
 
 ### s05: Skills
 
@@ -185,13 +175,7 @@ skills/
 
 **Tools**
 
-1. Bash
-2. Read File
-3. Write File
-4. Edit File
-5. Todo
-6. Task (subagent, only parent)
-7. \*Skill
+7. Skill
 
 ### s06: Compact
 
@@ -227,6 +211,10 @@ Key insight: "The agent can forget strategically and keep working forever."
                   Same as auto, triggered manually.
 ```
 
+**Tools**
+
+8. Compact
+
 ### s07: Task Manager
 
 Tasks persist as JSON files in tasks/ so they survive context compression.
@@ -252,6 +240,13 @@ Key insight: "State that survives compression -- because it's outside the conver
          +--- completing task 1 removes it from task 2's blockedBy
 ```
 
+**Tools**
+
+9. Task Create
+10. Task Update
+11. Task List
+12. Task Get
+
 ### s08: Background Tasks
 
 Run commands in background threads. A notification queue is drained before each LLM call to deliver results.
@@ -275,6 +270,57 @@ Key insight: "Fire and forget -- the agent doesn't block while the command runs.
                  |              |
                  +-- notification queue --> [results injected]
 ```
+
+**Tools**
+
+13. Background Task
+
+### Agent Teams
+
+Persistent named agents with file-based JSONL inboxes. Each teammate runs its own agent loop in a separate thread. Communication via append-only inboxes.
+
+- Subagent (s04):  spawn -> execute -> return summary -> destroyed
+- Teammate (s09):  spawn -> work -> idle -> work -> ... -> shutdown
+
+Key insight: "Teammates that can talk to each other."
+
+```
+    .team/config.json                   .team/inbox/
+    +----------------------------+      +------------------+
+    | {"team_name": "default",   |      | alice.jsonl      |
+    |  "members": [              |      | bob.jsonl        |
+    |    {"name":"alice",        |      | lead.jsonl       |
+    |     "role":"coder",        |      +------------------+
+    |     "status":"idle"}       |
+    |  ]}                        |      send_message("alice", "fix bug"):
+    +----------------------------+        open("alice.jsonl", "a").write(msg)
+                                        read_inbox("alice"):
+    spawn_teammate("alice","coder",...)   msgs = [json.loads(l) for l in ...]
+         |                                open("alice.jsonl", "w").close()
+         v                                return msgs  # drain
+    Thread: alice             Thread: bob
+    +------------------+      +------------------+
+    | agent_loop       |      | agent_loop       |
+    | status: working  |      | status: idle     |
+    | ... runs tools   |      | ... waits ...    |
+    | status -> idle   |      |                  |
+    +------------------+      +------------------+
+    5 message types (all declared, not all handled here):
+    +-------------------------+-----------------------------------+
+    | message                 | Normal text message               |
+    | broadcast               | Sent to all teammates             |
+    | shutdown_request        | Request graceful shutdown (s10)   |
+    | shutdown_response       | Approve/reject shutdown (s10)     |
+    | plan_approval_response  | Approve/reject plan (s10)         |
+    +-------------------------+-----------------------------------+
+```
+
+**Tools**
+
+14. Spawn Teammate
+15. List Teammate
+16. Read Inbox
+17. Broadcast
 
 ## Tests
 
@@ -329,6 +375,14 @@ Key insight: "Fire and forget -- the agent doesn't block while the command runs.
 1. Run "sleep 5 && echo done" in the background, then create a file while it runs
 2. Start 3 background tasks: "sleep 2", "sleep 4", "sleep 6". Check their status.
 3. Run pytest in the background and keep working on other things
+
+**s09**
+
+1. Spawn alice (coder) and bob (tester). Have alice send bob a message.
+2. Broadcast "status update: phase 1 complete" to all teammates
+3. Check the lead inbox for any messages
+4. Type `/team` to see the team roster with statuses
+5. Type `/inbox` to manually check the leader's inbox
 
 ## Explorer
 
