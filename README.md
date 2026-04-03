@@ -8,11 +8,11 @@ This project is an implementation of https://learn.shareai.run/.
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
-Python                           1             58             45            434
+Python                           1             63             52            508
 Markdown                         1             76              0            259
 TOML                             1              0              0             10
 -------------------------------------------------------------------------------
-SUM:                             3            134             45            703
+SUM:                             3            139             52            777
 -------------------------------------------------------------------------------
 ```
 
@@ -252,6 +252,30 @@ Key insight: "State that survives compression -- because it's outside the conver
          +--- completing task 1 removes it from task 2's blockedBy
 ```
 
+### s08: Background Tasks
+
+Run commands in background threads. A notification queue is drained before each LLM call to deliver results.
+
+Key insight: "Fire and forget -- the agent doesn't block while the command runs."
+
+```
+    Main thread                Background thread
+    +-----------------+        +-----------------+
+    | agent loop      |        | task executes   |
+    | ...             |        | ...             |
+    | [LLM call]  <---+------- | enqueue(result) |
+    |  ^drain queue   |        +-----------------+
+    +-----------------+
+
+    Timeline:
+    Agent ----[spawn A]----[spawn B]----[other work]----
+                 |              |
+                 v              v
+              [A runs]      [B runs]        (parallel)
+                 |              |
+                 +-- notification queue --> [results injected]
+```
+
 ## Tests
 
 **s01**
@@ -299,6 +323,12 @@ Key insight: "State that survives compression -- because it's outside the conver
 2. List all tasks and show the dependency graph
 3. Complete task 1 and then list tasks to see task 2 unblocked
 4. Create a task board for refactoring: parse -> transform -> emit -> test, where transform and emit can run in parallel after parse. Then, list all tasks and show the dependency graph
+
+**s08**
+
+1. Run "sleep 5 && echo done" in the background, then create a file while it runs
+2. Start 3 background tasks: "sleep 2", "sleep 4", "sleep 6". Check their status.
+3. Run pytest in the background and keep working on other things
 
 ## Explorer
 

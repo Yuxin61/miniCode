@@ -3,6 +3,8 @@ import re
 import subprocess
 import time
 import json
+import threading
+import uuid
 from textwrap import dedent
 from pathlib import Path
 from pprint import pprint
@@ -96,6 +98,68 @@ def auto_compact(messages: list) -> list:
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
         {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
     ]
+
+
+# -- BackgroundManager: threaded execution + notification queue --
+class BackgroundManager:
+    def __init__(self):
+        self.tasks = {} # task_id -> {status, result, command}
+        self._notification_queue = []
+        self._lock = threading.Lock()
+    
+    def run(self, command: str) -> str:
+        """Start a background thread, return task_id immediately."""
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        thread = threading.Thread(
+            target=self._execute, args=(task_id, command), daemon=True
+        )
+        thread.start()
+        return f"Background task {task_id} started: {command[:80]}"
+    
+    def _execute(self, task_id: str, command: str):
+        """Thread target: run subprogress, capture output, push to queue."""
+        try:
+            r = subprocess.run(
+                command, shell=True, cwd=WORKDIR,
+                capture_output=True, text=True, timeout=300
+            )
+            output = (r.stdout + r.stderr).strip()[:50000]
+            status = "completed"
+        except subprocess.TimeoutExpired:
+            output = "Error: Timeout (300s)"
+            status = "error"
+        except Exception as e:
+            output = f"Error: {e}"
+            status = "error"
+        self.tasks[task_id]["status"] = status
+        self.tasks[task_id]["result"] = output or "(no output)"
+        with self._lock:
+            self._notification_queue.append({
+                "task_id": task_id,
+                "status": status,
+                "command": command[:80],
+                "result": (output or "(no output)")[:500],
+            })
+    
+    def check(self, task_id: str = None) -> str:
+        """Check status of one task or list all."""
+        if task_id:
+            t = self.tasks.get(task_id)
+            if not t:
+                return f"Error: Unknown task {task_id}"
+            return f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
+        lines = []
+        for tid, t in self.tasks.items():
+            lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
+        return "\n".join(lines) if lines else "No background tasks."
+    
+    def drain_notifications(self) -> list:
+        """Return and clear all pending completion notifications."""
+        with self._lock:
+            notifs = list(self._notification_queue)
+            self._notification_queue.clear()
+        return notifs
 
 
 # -- TaskManager: CRUD with dependency graph, persisted as JSON files --
@@ -265,7 +329,7 @@ class TodoManager:
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
-
+BG = BackgroundManager()
 TASKS = TaskManager(TASKS_DIR)
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 TODO = TodoManager()
@@ -292,7 +356,7 @@ SUBAGENT_SYSTEM = dedent(f"""
 
 
 def safe_content(content):
-    return content if content else "(empty)"
+    return content or "(empty)"
 
 
 def safe_path(p: str) -> Path:
@@ -350,17 +414,19 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 TOOL_HANDLERS = {
-    "bash":        lambda **kw: run_bash(kw["command"]),
-    "read_file":   lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file":  lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":   lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "todo":        lambda **kw: TODO.update(kw["items"]),
-    "load_skill":  lambda **kw: SKILL_LOADER.get_content(kw["name"]),
-    "compact":     lambda **kw: "Manual compression requested.",
-    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("addBlocks")),
-    "task_list":   lambda **kw: TASKS.list_all(),
-    "task_get":    lambda **kw: TASKS.get(kw["task_id"]),
+    "bash":             lambda **kw: run_bash(kw["command"]),
+    "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file":       lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":        lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "todo":             lambda **kw: TODO.update(kw["items"]),
+    "load_skill":       lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "compact":          lambda **kw: "Manual compression requested.",
+    "task_create":      lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_update":      lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("addBlocks")),
+    "task_list":        lambda **kw: TASKS.list_all(),
+    "task_get":         lambda **kw: TASKS.get(kw["task_id"]),
+    "background_run":   lambda **kw: BG.run(kw["command"]),
+    "check_background": lambda **kw: BG.check(kw.get("task_id")),
 }
 
 
@@ -438,6 +504,17 @@ PARENT_TOOLS = CHILD_TOOLS + [
          "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, 
          "required": ["subject"]
     }},
+    {"name": "background_run", "description": "Run command in background thread. Returns task_id immediately.",
+     "input_schema": {
+         "type": "object", 
+         "properties": {"command": {"type": "string"}}, 
+         "required": ["command"]
+    }},
+    {"name": "check_background", "description": "Check background task status. Omit task_id to list all.",
+     "input_schema": {
+         "type": "object", 
+         "properties": {"task_id": {"type": "string"}}
+    }},
 ]
 
 
@@ -472,6 +549,15 @@ def agent_loop(messages: list):
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
+        # TODO: 如果处于 tool_use loop, 这里会构造出 assis/tool_use - user/tool-result - user/bg-result - assis/noted 这样的序列，会影响后续 tool use 吗？而且因为只要不是 tool use，loop 直接 return，所以如果判断 agent state 是 TOOL_WAIT/NORMAL 的话，实际上只有在进入 loop 时才会加上 bg-res
+        # Drain background notifications and inject as system message before LLM call
+        notifs = BG.drain_notifications()
+        if notifs and messages:
+            notif_text = "\n".join(
+                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
+            )
+            messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
+            messages.append({"role": "assistant", "content": "Noted background results."})
         # Nag reminder is injected below, alongside tool results
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
