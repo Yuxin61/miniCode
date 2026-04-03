@@ -49,6 +49,11 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
+# -- Request trackers: correlate by request_id --
+shutdown_requests = {}
+plan_requests = {}
+_tracker_lock = threading.Lock()
+
 
 def estimate_tokens(messages: list) -> int:
     """Rough token count: ~4 chars per token."""
@@ -204,12 +209,15 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
     
     def _teammate_loop(self, name: str, role: str, prompt: str):
-        sys_prompt = (
-            f"You are '{name}', role: {role}, at {WORKDIR}. "
-            f"Use send_message to communicate. Complete your task."
-        )
+        sys_prompt = dedent(f"""
+            You are '{name}', role: {role}, at {WORKDIR}.
+            Use send_message to communicate. Complete your task.
+            Submit plans via plan_approval before major work.
+            Respond to shutdown_request with shutdown_response.
+        """)
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
+        should_exit = False
         for _ in range(50):
             inbox = BUS.read_inbox(name)
             for msg in inbox:
@@ -253,6 +261,27 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2, ensure_ascii=False)
+        if tool_name == "shutdown_response":
+            req_id = args["request_id"]
+            approve = args["approve"]
+            with _tracker_lock:
+                if req_id in shutdown_requests:
+                    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+            BUS.send(
+                sender, "lead", args.get("reason", ""),
+                "shutdown_response", {"request_id": req_id, "approve": approve},
+            )
+            return f"Shutdown {'approve' if approve else 'rejected'}"
+        if tool_name == "plan_approval":
+            plan_text = args.get("plan", "")
+            req_id = str(uuid.uuid4())[:8]
+            with _tracker_lock:
+                plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            BUS.send(
+                sender, "lead", plan_text, "plan_approval_response",
+                {"request_id": req_id, "plan": plan_text},
+            )
+            return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -269,6 +298,10 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
             {"name": "read_inbox", "description": "Read and drain your inbox.",
              "input_schema": {"type": "object", "properties": {}}},
+            {"name": "shutdown_response", "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
+             "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
+            {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
+             "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
         ]
 
     def list_all(self) -> str:
@@ -529,6 +562,7 @@ SYSTEM = dedent(f"""
     Use task tools to plan and track work.
 
     You can also take on the role of a team leader, spawn teammates, and communicate with them via inboxes.
+    Manage teammates with shutdown and plan approval protocols.
 
     Skills available:
     {SKILL_LOADER.get_descriptions()}
@@ -603,25 +637,59 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# -- Lead-specific protocol handlers --
+def handle_shutdown_request(teammate: str) -> str:
+    req_id = str(uuid.uuid4())[:8]
+    with _tracker_lock:
+        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    BUS.send(
+        "lead", teammate, "Please shut down gracefully.",
+        "shutdown_request", {"request_id": req_id},
+    )
+    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
+
+
+def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    with _tracker_lock:
+        req = plan_requests.get(request_id)
+    if not req:
+        return f"Error: Unknown plan request_id '{request_id}'"
+    with _tracker_lock:
+        req["status"] = "approved" if approve else "rejected"
+    BUS.send(
+        "lean", req["from"], feedback, "plan_approval_response",
+        {"request_id": request_id, "approve": approve, "feedback": feedback}
+    )
+    return f"Plan {req['status']} for '{req['from']}'"
+
+
+def _check_shutdown_status(request_id: str) -> str:
+    with _tracker_lock:
+        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
+
+
 TOOL_HANDLERS = {
-    "bash":             lambda **kw: run_bash(kw["command"]),
-    "read_file":        lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file":       lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":        lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "todo":             lambda **kw: TODO.update(kw["items"]),
-    "load_skill":       lambda **kw: SKILL_LOADER.get_content(kw["name"]),
-    "compact":          lambda **kw: "Manual compression requested.",
-    "task_create":      lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
-    "task_update":      lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("addBlocks")),
-    "task_list":        lambda **kw: TASKS.list_all(),
-    "task_get":         lambda **kw: TASKS.get(kw["task_id"]),
-    "background_run":   lambda **kw: BG.run(kw["command"]),
-    "check_background": lambda **kw: BG.check(kw.get("task_id")),
-    "spawn_teammate":  lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
-    "list_teammates":  lambda **kw: TEAM.list_all(),
-    "send_message":    lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
-    "read_inbox":      lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2, ensure_ascii=False),
-    "broadcast":       lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "bash":              lambda **kw: run_bash(kw["command"]),
+    "read_file":         lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file":        lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":         lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "todo":              lambda **kw: TODO.update(kw["items"]),
+    "load_skill":        lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "compact":           lambda **kw: "Manual compression requested.",
+    "task_create":       lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_update":       lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("addBlockedBy"), kw.get("addBlocks")),
+    "task_list":         lambda **kw: TASKS.list_all(),
+    "task_get":          lambda **kw: TASKS.get(kw["task_id"]),
+    "background_run":    lambda **kw: BG.run(kw["command"]),
+    "check_background":  lambda **kw: BG.check(kw.get("task_id")),
+    "spawn_teammate":    lambda **kw: TEAM.spawn(kw["name"], kw["role"], kw["prompt"]),
+    "list_teammates":    lambda **kw: TEAM.list_all(),
+    "send_message":      lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
+    "read_inbox":        lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2, ensure_ascii=False),
+    "broadcast":         lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
+    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
+    "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
 }
 
 
@@ -737,6 +805,24 @@ PARENT_TOOLS = CHILD_TOOLS + [
          "type": "object", 
          "properties": {"content": {"type": "string"}}, 
          "required": ["content"]
+    }},
+    {"name": "shutdown_request", "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+     "input_schema": {
+         "type": "object", 
+         "properties": {"teammate": {"type": "string"}}, 
+         "required": ["teammate"]
+    }},
+    {"name": "shutdown_response", "description": "Check the status of a shutdown request by request_id.",
+     "input_schema": {
+         "type": "object", 
+         "properties": {"request_id": {"type": "string"}}, 
+         "required": ["request_id"]
+    }},
+    {"name": "plan_approval", "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
+     "input_schema": {
+         "type": "object", 
+         "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, 
+         "required": ["request_id", "approve"]
     }},
 ]
 

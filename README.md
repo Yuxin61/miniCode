@@ -275,7 +275,7 @@ Key insight: "Fire and forget -- the agent doesn't block while the command runs.
 
 13. Background Task
 
-### Agent Teams
+### s09: Agent Teams
 
 Persistent named agents with file-based JSONL inboxes. Each teammate runs its own agent loop in a separate thread. Communication via append-only inboxes.
 
@@ -321,6 +321,57 @@ Key insight: "Teammates that can talk to each other."
 15. List Teammate
 16. Read Inbox
 17. Broadcast
+
+### s10: Team Protocols
+
+Shutdown protocol and plan approval protocol, both using the same `request_id` correlation pattern. Builds on s09's team messaging.
+
+Key insight: "Same request_id correlation pattern, two domains."
+
+```
+    Shutdown FSM: pending -> approved | rejected
+
+    Lead                              Teammate
+    +---------------------+          +---------------------+
+    | shutdown_request    |          |                     |
+    | {                   | -------> | receives request    |
+    |   request_id: abc   |          | decides: approve?   |
+    | }                   |          |                     |
+    +---------------------+          +---------------------+
+                                             |
+    +---------------------+          +-------v-------------+
+    | shutdown_response   | <------- | shutdown_response   |
+    | {                   |          | {                   |
+    |   request_id: abc   |          |   request_id: abc   |
+    |   approve: true     |          |   approve: true     |
+    | }                   |          | }                   |
+    +---------------------+          +---------------------+
+            |
+            v
+    status -> "shutdown", thread stops
+
+    Plan approval FSM: pending -> approved | rejected
+    
+    Teammate                          Lead
+    +---------------------+          +---------------------+
+    | plan_approval       |          |                     |
+    | submit: {plan:"..."}| -------> | reviews plan text   |
+    +---------------------+          | approve/reject?     |
+                                     +---------------------+
+                                             |
+    +---------------------+          +-------v-------------+
+    | plan_approval_resp  | <------- | plan_approval       |
+    | {approve: true}     |          | review: {req_id,    |
+    +---------------------+          |   approve: true}    |
+                                     +---------------------+
+    Trackers: {request_id: {"target|from": name, "status": "pending|..."}}
+```
+
+**Tools**
+
+18. Shutdown Request
+19. Shutdown Response
+20. Plan Approval
 
 ## Tests
 
@@ -384,6 +435,289 @@ Key insight: "Teammates that can talk to each other."
 4. Type `/team` to see the team roster with statuses
 5. Type `/inbox` to manually check the leader's inbox
 
-## Explorer
+**s10**
 
-TODO.
+1. Spawn alice as a coder. Then request her shutdown.
+2. List teammates to see alice's status after shutdown approval
+3. Spawn bob with a risky refactoring task. Review and reject his plan.
+4. Spawn charlie, have him submit a plan, then approve it.
+5. Type `/team` to monitor statuses
+
+## Explorer: Design Decisions
+
+**s01: The Agent Loop**
+
+### Why Bash Alone Is Enough
+
+Bash can read files, write files, run arbitrary programs, pipe data between processes, and manage the filesystem. Any additional tool (read_file, write_file, etc.) would be a strict subset of what bash already provides. Adding more tools doesn't unlock new capabilities -- it just adds surface area for confusion. The model has to learn fewer tool schemas, and the implementation stays under 100 lines. This is the minimal viable agent: one tool, one loop.
+
+**Alternatives Considered**
+
+We could have started with a richer toolset (file I/O, HTTP, database), but that would obscure the core insight: an LLM with a shell is already a general-purpose agent. Starting minimal also makes it obvious what each subsequent version actually adds.
+
+### Recursive Process Spawning as Subagent Mechanism
+
+When the agent runs `python v0.py "subtask"`, it spawns a completely new process with a fresh LLM context. This child process is effectively a subagent: it has its own system prompt, its own conversation history, and its own task focus. When it finishes, the parent gets the stdout result. This is subagent delegation without any framework -- just Unix process semantics. Each child process naturally isolates concerns because it literally cannot see the parent's context.
+
+**Alternatives Considered**
+
+A framework-level subagent system (like v3's Task tool) gives more control over what tools the subagent can access and how results are returned. But at v0, the point is to show that process spawning is the most primitive form of agent delegation -- no shared memory, no message passing, just stdin/stdout.
+
+### No Planning Framework -- The Model Decides
+
+There is no planner, no task queue, no state machine. The system prompt tells the model how to approach problems, and the model decides what bash command to run next based on the conversation so far. This is intentional: at this level, adding a planning layer would be premature abstraction. The model's chain-of-thought IS the plan. The agent loop just keeps asking the model what to do until it stops requesting tools.
+
+**Alternatives Considered**
+
+Later versions (v2) add explicit planning via TodoWrite. But v0 proves that implicit planning through the model's reasoning is sufficient for many tasks. The planning framework only becomes necessary when you need external visibility into the agent's intentions.
+
+**s02: Tools**
+
+### Why Exactly Four Tools
+
+The four tools are bash, read_file, write_file, and edit_file. Together they cover roughly 95% of coding tasks. Bash handles execution and arbitrary commands. Read_file provides precise file reading with line numbers. Write_file creates or overwrites files. Edit_file does surgical string replacement. More tools would increase the model's cognitive load -- it has to decide which tool to use, and more options means more chances of picking the wrong one. Fewer tools also means fewer tool schemas to maintain and fewer edge cases to handle.
+
+**Alternatives Considered**
+
+We could add specialized tools (list_directory, search_files, http_request), and later versions do. But at this stage, bash already covers those use cases. The split from v0's single tool to v1's four tools is specifically about giving the model structured I/O for file operations, where bash's quoting and escaping often trips up the model.
+
+### The Model IS the Agent
+
+The core agent loop is trivially simple: while True, call the LLM, if it returns tool_use blocks then execute them and feed results back, if it returns only text then stop. There is no router, no decision tree, no workflow engine. The model itself decides what to do, when to stop, and how to recover from errors. The code is just plumbing that connects the model to tools. This is a philosophical stance: agent behavior emerges from the model, not from the framework.
+
+**Alternatives Considered**
+
+Many agent frameworks add elaborate orchestration layers: ReAct loops with explicit Thought/Action/Observation parsing, LangChain-style chains, AutoGPT-style goal decomposition. These frameworks assume the model needs scaffolding to behave as an agent. Our approach assumes the model already knows how to be an agent -- it just needs tools to act on the world.
+
+### JSON Schemas for Every Tool
+
+Each tool defines a strict JSON schema for its input parameters. For example, edit_file requires old_string and new_string as exact strings, not regex patterns. This eliminates an entire class of bugs: the model can't pass malformed input because the API validates against the schema before execution. It also makes the model's intent unambiguous -- when it calls edit_file with specific strings, there's no parsing ambiguity about what it wants to change.
+
+**Alternatives Considered**
+
+Some agent systems let the model output free-form text that gets parsed with regex or heuristics (e.g., extracting code from markdown blocks). This is fragile -- the model might format output slightly differently and break the parser. JSON schemas trade flexibility for reliability.
+
+**s03: Todo**
+
+### Making Plans Visible via TodoWrite
+
+Instead of letting the model plan silently in its chain-of-thought, we force plans to be externalized through the TodoWrite tool. Each plan item has a status (pending, in_progress, completed) that gets tracked explicitly. This has three benefits: (1) users can see what the agent intends to do before it does it, (2) developers can debug agent behavior by inspecting the plan state, (3) the agent itself can refer back to its plan in later turns when earlier context has scrolled away.
+
+**Alternatives Considered**
+
+The model could plan internally via chain-of-thought reasoning (as it does in v0/v1). Internal planning works but is invisible and ephemeral -- once the thinking scrolls out of context, the plan is lost. Claude's extended thinking is another option, but it's not inspectable by the user or by downstream tools.
+
+### Only One Task Can Be In-Progress
+
+The TodoWrite tool enforces that at most one task has status 'in_progress' at any time. If the model tries to start a second task, it must first complete or abandon the current one. This constraint prevents a subtle failure mode: models that try to 'multitask' by interleaving work on multiple items tend to lose track of state and produce half-finished results. Sequential focus produces higher quality than parallel thrashing.
+
+**Alternatives Considered**
+
+Allowing multiple in-progress items would let the agent context-switch between tasks, which seems more flexible. In practice, LLMs handle context-switching poorly -- they lose track of which task they were working on and mix up details between tasks. The single-focus constraint is a guardrail that improves output quality.
+
+### Maximum of 20 Plan Items
+
+TodoWrite caps the plan at 20 items. This is a deliberate constraint against over-planning. Models tend to decompose tasks into increasingly fine-grained steps when unconstrained, producing 50-item plans where each step is trivial. Long plans are fragile: if step 15 fails, the remaining 35 steps may all be invalid. Short plans (under 20 items) stay at the right abstraction level and are easier to adapt when reality diverges from the plan.
+
+**Alternatives Considered**
+
+No cap would give the model full flexibility, but in practice leads to absurdly detailed plans. A dynamic cap (proportional to task complexity) would be smarter but adds complexity. The fixed cap of 20 is a simple heuristic that works well empirically -- most real coding tasks can be expressed in 5-15 meaningful steps.
+
+**s04: Subagents**
+
+### Subagents Get Fresh Context, Not Shared History
+
+When a parent agent spawns a subagent via the Task tool, the subagent starts with a clean message history containing only the system prompt and the delegated task description. It does NOT inherit the parent's conversation. This is context isolation: the subagent can focus entirely on its specific subtask without being distracted by hundreds of messages from the parent's broader conversation. The result is returned to the parent as a single tool_result, collapsing potentially dozens of subagent turns into one concise answer.
+
+**Alternatives Considered**
+
+Sharing the parent's full context would give the subagent more information, but it would also flood the subagent with irrelevant details. Context window is finite -- filling it with parent history leaves less room for the subagent's own work. Fork-based approaches (copy the parent context) are a middle ground but still waste tokens on irrelevant history.
+
+
+### Explore Agents Cannot Write Files
+
+When spawning a subagent with the 'Explore' type, it receives only read-only tools: bash (with restrictions), read_file, and search tools. It cannot call write_file or edit_file. This implements the principle of least privilege: an agent tasked with 'find all usages of function X' doesn't need write access. Removing write tools eliminates the risk of accidental file modification during exploration, and it also narrows the tool space so the model makes better decisions with fewer options.
+
+**Alternatives Considered**
+
+Giving all subagents full tool access is simpler to implement but violates least privilege. A permission-request system (subagent asks parent for write access) adds complexity and latency. Static tool filtering by role is the pragmatic middle ground -- simple to implement, effective at preventing accidents.
+
+### Subagents Cannot Spawn Their Own Subagents
+
+The Task tool is not included in the subagent's tool set. A subagent must complete its work directly -- it cannot delegate further. This prevents infinite delegation loops: without this constraint, an agent could spawn a subagent that spawns another subagent, each one re-delegating the same task in slightly different words, consuming tokens without making progress. One level of delegation handles the vast majority of use cases. If a task is too complex for a single subagent, the parent should decompose it differently.
+
+**Alternatives Considered**
+
+Allowing recursive delegation (bounded by depth) would handle deeply nested tasks but adds complexity and the risk of runaway token consumption. In practice, single-level delegation covers most real-world coding tasks. Multi-level delegation is addressed in later versions (v6+) through persistent team structures instead of recursive spawning.
+
+**s05: Skills**
+
+### Skills Inject via tool_result, Not System Prompt
+
+When the agent invokes the Skill tool, the skill's content (a SKILL.md file) is returned as a tool_result in a user message, not injected into the system prompt. This is a deliberate caching optimization: the system prompt remains static across turns, which means API providers can cache it (Anthropic's prompt caching, OpenAI's system message caching). If skill content were in the system prompt, it would change every time a new skill is loaded, invalidating the cache. By putting dynamic content in tool_result, we keep the expensive system prompt cacheable while still getting skill knowledge into context.
+
+**Alternatives Considered**
+
+Injecting skills into the system prompt is simpler and gives skills higher priority in the model's attention. But it breaks prompt caching (every skill load creates a new system prompt variant) and bloats the system prompt over time as skills accumulate. The tool_result approach keeps things cache-friendly at the cost of slightly lower attention priority.
+
+### On-Demand Skill Loading Instead of Upfront
+
+Skills are not loaded at startup. The agent starts with only the skill names and descriptions (from frontmatter). When the agent decides it needs a specific skill, it calls the Skill tool, which loads the full SKILL.md body into context. This keeps the initial prompt small and focused. An agent solving a Python bug doesn't need the Kubernetes deployment skill loaded -- that would waste context window space and potentially confuse the model with irrelevant instructions.
+
+**Alternatives Considered**
+
+Loading all skills upfront guarantees the model always has all knowledge available, but wastes tokens on irrelevant skills and may hit context limits. A recommendation system (model suggests skills, human approves) adds latency. Lazy loading lets the model self-serve the knowledge it needs, when it needs it.
+
+### YAML Frontmatter + Markdown Body in SKILL.md
+
+Each SKILL.md file has two parts: YAML frontmatter (name, description, globs) and a markdown body (the actual instructions). The frontmatter serves as metadata for the skill registry -- it's what gets listed when the agent asks 'what skills are available?' The body is the payload that gets loaded on demand. This separation means you can list 100 skills (reading only frontmatter, a few bytes each) without loading 100 full instruction sets (potentially thousands of tokens each).
+
+**Alternatives Considered**
+
+A separate metadata file (skill.yaml + skill.md) would work but doubles the number of files. Embedding metadata in the markdown (as headings or comments) requires parsing the full file to extract metadata. Frontmatter is a well-established convention (Jekyll, Hugo, Astro) that keeps metadata and content co-located but separately parseable.
+
+**s06: Compact**
+
+### Three-Layer Compression Strategy
+
+Context management uses three distinct layers, each with different cost/benefit profiles. (1) Microcompact runs every turn and is nearly free: it truncates tool_result blocks from older messages, stripping verbose command output that's no longer needed. (2) Auto_compact triggers when token count exceeds a threshold: it calls the LLM to generate a conversation summary, which is expensive but dramatically reduces context size. (3) Manual compact is user-triggered for explicit 'start fresh' moments. Layering these means the cheap operation runs constantly (keeping context tidy) while the expensive operation runs rarely (only when actually needed).
+
+**Alternatives Considered**
+
+A single compression strategy (e.g., always summarize at 80% capacity) would be simpler but wasteful -- most of the time, microcompact alone keeps things manageable. A sliding window (drop oldest N messages) is cheap but loses important context. The three-layer approach gives the best token efficiency: cheap cleanup constantly, expensive summarization rarely.
+
+### MIN_SAVINGS = 20,000 Tokens Before Compressing
+
+Auto_compact only triggers when the estimated savings (current tokens minus estimated summary size) exceed 20,000 tokens. Compression is not free: the summary itself consumes tokens, plus there's the API call cost to generate it. If the conversation is only 25,000 tokens, compressing might save 5,000 tokens but cost an API call and produce a summary that's less coherent than the original. The 20K threshold ensures compression only happens when the savings meaningfully exceed the overhead.
+
+**Alternatives Considered**
+
+A percentage-based threshold (compress when context is 80% full) adapts to different context window sizes but doesn't account for the fixed cost of generating a summary. A fixed threshold of 10K would compress more aggressively but often isn't worth it. The 20K value was chosen empirically: it's the point where compression savings consistently outweigh the quality loss from summarization.
+
+### Summary Replaces ALL Messages, Not Partial History
+
+When auto_compact fires, it generates a summary and replaces the ENTIRE message history with that summary. It does not keep the last N messages alongside the summary. This avoids a subtle coherence problem: if you keep recent messages plus a summary of older ones, the model sees two representations of overlapping content. The summary might say 'we decided to use approach X' while a recent message still shows the deliberation process, creating contradictory signals. A clean summary is a single coherent narrative.
+
+**Alternatives Considered**
+
+Keeping the last 5-10 messages alongside the summary preserves recent detail and gives the model more to work with. But it creates the overlap problem described above, and makes the total context size less predictable. Some systems use a 'sliding window + summary' approach which works but requires careful tuning of the overlap region.
+
+### Full Conversation Archived to JSONL on Disk
+
+Even though context is compressed in memory, the full uncompressed conversation is appended to a JSONL file on disk. Every message, every tool call, every result -- nothing is lost. This means compression is a lossy operation on the in-memory context but a lossless operation on the permanent record. Post-hoc analysis (debugging agent behavior, computing token usage, training data extraction) can always work from the complete transcript. The JSONL format is append-only, making it safe for concurrent writes and easy to stream-process.
+
+**Alternatives Considered**
+
+Not archiving saves disk space but makes debugging hard -- when the agent makes a mistake, you can't see what it was 'thinking' 200 messages ago because that context was compressed away. Database storage (SQLite) would provide queryability but adds a dependency. JSONL is the simplest format that supports append-only writes and line-by-line processing.
+
+**s07: Tasks**
+
+### Tasks Stored as JSON Files, Not In-Memory
+
+Tasks are persisted as JSON files in a .tasks/ directory on the filesystem instead of being held in memory. This has three critical benefits: (1) Tasks survive process crashes -- if the agent dies mid-task, the task board is still on disk when it restarts. (2) Multiple agents can read and write to the same task directory, enabling multi-agent coordination without shared memory. (3) Humans can inspect and manually edit task files for debugging. The filesystem becomes the shared database.
+
+**Alternatives Considered**
+
+In-memory storage (like v2's TodoWrite) is simpler and faster but loses state on crash and doesn't work across multiple agent processes. A proper database (SQLite, Redis) would provide ACID guarantees and better concurrency, but adds a dependency and operational complexity. Files are the zero-dependency persistence layer that works everywhere.
+
+### Tasks Have blocks/blockedBy Dependency Fields
+
+Each task can declare which other tasks it blocks (downstream dependents) and which tasks block it (upstream dependencies). An agent will not start a task that has unresolved blockedBy dependencies. This is essential for multi-agent coordination: when Agent A is writing the database schema and Agent B needs to write queries against it, Agent B's task is blockedBy Agent A's task. Without dependencies, both agents might start simultaneously and Agent B would work against a schema that doesn't exist yet.
+
+**Alternatives Considered**
+
+Simple priority ordering (high/medium/low) doesn't capture 'task B literally cannot start until task A finishes.' A centralized coordinator that assigns tasks in order would work but creates a single point of failure and bottleneck. Declarative dependencies let each agent independently determine what it can work on by reading the task files.
+
+### Task as Course Default, Todo Still Useful
+
+TaskManager extends the Todo mental model and becomes the default workflow from s07 onward in this course. Both track work items with statuses, but TaskManager adds file persistence (survives crashes), dependency tracking (blocks/blockedBy), ownership fields, and multi-process coordination. Todo remains useful for short, linear, one-shot tracking where heavyweight coordination is unnecessary.
+
+**Alternatives Considered**
+
+Using only Todo keeps the model minimal but weak for long-running or collaborative work. Using only Task everywhere maximizes consistency but can feel heavy for tiny one-off tasks.
+
+### Durability Needs Write Discipline
+
+File persistence reduces context loss, but it does not remove concurrent-write risks by itself. Before writing task state, reload the JSON, validate expected status/dependency fields, and then save atomically. This prevents one agent from silently overwriting another agent's transition.
+
+**Alternatives Considered**
+
+Blind overwrite writes are simpler but can corrupt coordination state under parallel execution. A database with optimistic locking would enforce stronger safety, but the course keeps file-based state for zero-dependency teaching.
+
+**s08: Background Tasks**
+
+### threading.Queue as the Notification Bus
+
+Background task results are delivered via a threading.Queue instead of direct callbacks. The background thread puts a notification on the queue when its work completes. The main agent loop polls the queue before each LLM call. This decoupling is important: the background thread doesn't need to know anything about the main loop's state or timing. It just drops a message on the queue and moves on. The main loop picks it up at its own pace -- never mid-API-call, never mid-tool-execution. No race conditions, no callback hell.
+
+**Alternatives Considered**
+
+Direct callbacks (background thread calls a function in the main thread) would deliver results faster but create thread-safety issues -- the callback might fire while the main thread is in the middle of building a request. Event-driven systems (asyncio, event emitters) work but add complexity. A queue is the simplest thread-safe communication primitive.
+
+### Background Tasks Run as Daemon Threads
+
+Background task threads are created with daemon=True. In Python, daemon threads are killed automatically when the main thread exits. This prevents a common problem: if the main agent completes its work and exits, but a background thread is still running (waiting on a long API call, stuck in a loop), the process would hang indefinitely. With daemon threads, exit is clean -- the main thread finishes, all daemon threads die, process exits. No zombie processes, no cleanup code needed.
+
+**Alternatives Considered**
+
+Non-daemon threads with explicit cleanup (join with timeout, then terminate) give more control over shutdown but require careful lifecycle management. Process-based parallelism (multiprocessing) provides stronger isolation but higher overhead. Daemon threads are the pragmatic choice: minimal code, correct behavior in the common case.
+
+### Structured Notification Format with Type Tags
+
+Notifications from background tasks use a structured format: `{"type": "attachment", "attachment": {status, result, ...}}` instead of plain text strings. The type tag lets the main loop handle different notification types differently: an 'attachment' might be injected into the conversation as a tool_result, while a 'status_update' might just update a progress indicator. Machine-readable notifications also enable programmatic filtering (show only errors, suppress progress updates) and UI rendering (display status as a progress bar, not raw text).
+
+**Alternatives Considered**
+
+Plain text notifications are simpler but lose structure. The main loop would have to parse free-form text to determine what happened, which is fragile. A class hierarchy (StatusNotification, ResultNotification, ErrorNotification) is more Pythonic but less portable -- JSON structures work the same way regardless of language or serialization format.
+
+**s09: Agent Teams**
+
+### Persistent Teammates vs One-Shot Subagents
+
+In s04, subagents are ephemeral: spawn, do one task, return result, die. Their knowledge dies with them. In s09, teammates are persistent threads with identity (name, role) and config files. A teammate can complete task A, then be assigned task B, carrying forward everything it learned. Persistent teammates accumulate project knowledge, understand established patterns, and don't need to re-read the same files for every task.
+
+**Alternatives Considered**
+
+One-shot subagents (s04 style) are simpler and provide perfect context isolation -- no risk of one task's context polluting another. But the re-learning cost is high: every new task starts from zero. A middle ground (subagents with shared memory/knowledge base) was considered but adds complexity without the full benefit of persistent identity and state.
+
+### Team Config Persisted to .teams/{name}/config.json
+
+Team structure (member names, roles, agent IDs) is stored in a JSON config file, not in any agent's memory. Any agent can discover its teammates by reading the config file -- no need for a discovery service or shared memory. If an agent crashes and restarts, it reads the config to find out who else is on the team. This is consistent with the s07 philosophy: the filesystem is the coordination layer.
+
+**Alternatives Considered**
+
+In-memory team registries are faster but don't survive process restarts and require a central process to maintain. Service discovery (like DNS or a discovery server) is more robust at scale but overkill for a local multi-agent system. File-based config is the simplest approach that works across independent processes.
+
+### Teammates Get Subset of Tools, Lead Gets All
+
+The team lead receives ALL_TOOLS (including spawn, send, read_inbox, etc.) while teammates receive TEAMMATE_TOOLS (a reduced set focused on task execution). This enforces a clear separation of concerns: teammates focus on doing work (coding, testing, researching), while the lead focuses on coordination (creating tasks, assigning work, managing communication). Giving teammates coordination tools would let them create their own sub-teams or reassign tasks, undermining the lead's ability to maintain a coherent plan.
+
+**Alternatives Considered**
+
+Giving all agents identical tools is simpler and more egalitarian, but in practice leads to coordination chaos -- multiple agents trying to manage each other, creating conflicting task assignments. Static role-based filtering is predictable and easy to reason about.
+
+**s10: Team Protocols**
+
+### JSONL Inbox Files Instead of Shared Memory
+
+Each teammate has its own inbox file (a JSONL file in the team directory). Sending a message means appending a JSON line to the recipient's inbox file. Reading messages means reading the inbox file and tracking which line was last read. JSONL is append-only by nature, which means concurrent writers don't corrupt each other's data (appends to different file positions). This works across processes without any shared memory, mutex, or IPC mechanism. It's also crash-safe: if the writer crashes mid-append, the worst case is one partial line that the reader can skip.
+
+**Alternatives Considered**
+
+Shared memory (Python multiprocessing.Queue) would be faster but doesn't work if agents are separate processes launched independently. A message broker (Redis, RabbitMQ) provides robust pub/sub but adds infrastructure dependencies. Unix domain sockets would work but are harder to debug (no human-readable message log). JSONL files are the simplest approach that provides persistence, cross-process communication, and debuggability.
+
+### Exactly Five Message Types Cover All Coordination Patterns
+
+The messaging system supports exactly five types: (1) 'message' for point-to-point communication between two agents, (2) 'broadcast' for team-wide announcements, (3) 'shutdown_request' for graceful termination, (4) 'shutdown_response' for acknowledging shutdown, (5) 'plan_approval_response' for the lead to approve or reject a teammate's plan. These five types map to the fundamental coordination patterns: direct communication, broadcast, lifecycle management, and approval workflows.
+
+**Alternatives Considered**
+
+A single generic message type with metadata fields would be more flexible but makes it harder to enforce protocol correctness. Many more types (10+) would provide finer-grained semantics but increase the model's decision burden. Five types is the sweet spot where every type has a clear, distinct purpose.
+
+### Check Inbox Before Every LLM Call
+
+Teammates check their inbox file at the top of every agent loop iteration, before calling the LLM API. This ensures maximum responsiveness to incoming messages: a shutdown request is seen within one loop iteration (typically seconds), not after the current task completes (potentially minutes). The inbox check is cheap (read a small file, check if new lines exist) compared to the LLM call (seconds of latency, thousands of tokens). This placement also means incoming messages can influence the next LLM call -- a message saying 'stop working on X, switch to Y' takes effect immediately.
+
+**Alternatives Considered**
+
+Checking inbox after each tool execution would be more responsive but adds overhead to every tool call, which is more frequent than LLM calls. A separate watcher thread could monitor the inbox continuously but adds threading complexity. Checking once per LLM call is the pragmatic sweet spot: responsive enough for coordination, cheap enough to not impact performance.
