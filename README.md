@@ -8,11 +8,11 @@ This project is an implementation of https://learn.shareai.run/.
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
-Python                           1             86             57            726
-Markdown                         1             91              0            298
+Python                           1            103             74            904
+Markdown                         1            292              0            564
 TOML                             1              0              0             10
 -------------------------------------------------------------------------------
-SUM:                             3            177             57           1034
+SUM:                             3            395             74           1478
 -------------------------------------------------------------------------------
 ```
 
@@ -27,6 +27,10 @@ MODEL_ID=
 ## Stages
 
 ### s01. The Agent Loop
+
+A language model can reason about code, but it can't touch the real world -- can't read files, run tests, or check errors. Without a loop, every tool call requires you to manually copy-paste results back. You become the loop.
+
+---
 
 The entire secret of an AI coding agent in one pattern:
 
@@ -58,6 +62,12 @@ This is the core loop: feed tool results back to the model until the model decid
 
 ### s02: Tool Use
 
+With only `bash`, the agent shells out for everything. `cat` truncates unpredictably, sed fails on special characters, and every bash call is an unconstrained security surface. Dedicated tools like `read_file` and `write_file` let you enforce path sandboxing at the tool level.
+
+The key insight: adding tools does not require changing the loop.
+
+---
+
 The agent loop from s01 didn't change. We just added tools to the array and a dispatch map to route calls.
 
 Key insight: "The loop didn't change at all. I just added tools."
@@ -81,6 +91,10 @@ Key insight: "The loop didn't change at all. I just added tools."
 4. Edit File
 
 ### s03: Todo List
+
+On multi-step tasks, the model loses track. It repeats work, skips steps, or wanders off. Long conversations make this worse -- the system prompt fades as tool results fill the context. A 10-step refactoring might complete steps 1-3, then the model starts improvising because it forgot steps 4-10.
+
+---
 
 The model tracks its own progress via a TodoManager. A nag reminder forces it to keep updating when it forgets.
 
@@ -113,6 +127,10 @@ Key insight: "The agent can track its own progress -- and I can see it."
 
 ### s04: Subagent
 
+As the agent works, its messages array grows. Every file read, every bash output stays in context permanently. "What testing framework does this project use?" might require reading 5 files, but the parent only needs the answer: "pytest."
+
+---
+
 Spawn a child agent with fresh `messages=[]`. The child works in its own context, sharing the filesystem, then returns only a summary to the parent.
 
 Key insight: "Process isolation gives context isolation for free."
@@ -138,6 +156,10 @@ Key insight: "Process isolation gives context isolation for free."
 6. Task (subagent, only parent)
 
 ### s05: Skills
+
+You want the agent to follow domain-specific workflows: git conventions, testing patterns, code review checklists. Putting everything in the system prompt wastes tokens on unused skills. 10 skills at 2000 tokens each = 20,000 tokens, most of which are irrelevant to any given task.
+
+---
 
 Two-layer skill injection that avoids bloating the system prompt:
 
@@ -179,6 +201,10 @@ skills/
 
 ### s06: Compact
 
+The context window is finite. A single `read_file` on a 1000-line file costs ~4000 tokens. After reading 30 files and running 20 bash commands, you hit 100,000+ tokens. The agent cannot work on large codebases without compression.
+
+---
+
 Context will fill up; three-layer compression strategy enables infinite sessions.
 
 Key insight: "The agent can forget strategically and keep working forever."
@@ -217,6 +243,12 @@ Key insight: "The agent can forget strategically and keep working forever."
 
 ### s07: Task Manager
 
+s03's TodoManager is a flat checklist in memory: no ordering, no dependencies, no status beyond done-or-not. Real goals have structure -- task B depends on task A, tasks C and D can run in parallel, task E waits for both C and D.
+
+Without explicit relationships, the agent can't tell what's ready, what's blocked, or what can run concurrently. And because the list lives only in memory, context compression (s06) wipes it clean.
+
+---
+
 Tasks persist as JSON files in tasks/ so they survive context compression.
 
 Each task has a dependency graph (blockedBy/blocks).
@@ -249,6 +281,10 @@ Key insight: "State that survives compression -- because it's outside the conver
 
 ### s08: Background Tasks
 
+Some commands take minutes: `npm install`, `pytest`, `docker build`. With a blocking loop, the model sits idle waiting. If the user asks "install dependencies and while that runs, create the config file," the agent does them sequentially, not in parallel.
+
+---
+
 Run commands in background threads. A notification queue is drained before each LLM call to deliver results.
 
 Key insight: "Fire and forget -- the agent doesn't block while the command runs."
@@ -276,6 +312,12 @@ Key insight: "Fire and forget -- the agent doesn't block while the command runs.
 13. Background Task
 
 ### s09: Agent Teams
+
+Subagents (s04) are disposable: spawn, work, return summary, die. No identity, no memory between invocations. Background tasks (s08) run shell commands but can't make LLM-guided decisions.
+
+Real teamwork needs: (1) persistent agents that outlive a single prompt, (2) identity and lifecycle management, (3) a communication channel between agents.
+
+---
 
 Persistent named agents with file-based JSONL inboxes. Each teammate runs its own agent loop in a separate thread. Communication via append-only inboxes.
 
@@ -324,6 +366,16 @@ Key insight: "Teammates that can talk to each other."
 
 ### s10: Team Protocols
 
+In s09, teammates work and communicate but lack structured coordination:
+
+Shutdown: Killing a thread leaves files half-written and config.json stale. You need a handshake: the lead requests, the teammate approves (finish and exit) or rejects (keep working).
+
+Plan approval: When the lead says "refactor the auth module," the teammate starts immediately. For high-risk changes, the lead should review the plan first.
+
+Both share the same structure: one side sends a request with a unique ID, the other responds referencing that ID.
+
+---
+
 Shutdown protocol and plan approval protocol, both using the same `request_id` correlation pattern. Builds on s09's team messaging.
 
 Key insight: "Same request_id correlation pattern, two domains."
@@ -351,7 +403,7 @@ Key insight: "Same request_id correlation pattern, two domains."
     status -> "shutdown", thread stops
 
     Plan approval FSM: pending -> approved | rejected
-    
+
     Teammate                          Lead
     +---------------------+          +---------------------+
     | plan_approval       |          |                     |
@@ -372,6 +424,53 @@ Key insight: "Same request_id correlation pattern, two domains."
 18. Shutdown Request
 19. Shutdown Response
 20. Plan Approval
+
+### s11: Autonomous Agents
+
+In s09-s10, teammates only work when explicitly told to. The lead must spawn each one with a specific prompt. 10 unclaimed tasks on the board? The lead assigns each one manually. Doesn't scale.
+
+True autonomy: teammates scan the task board themselves, claim unclaimed tasks, work on them, then look for more.
+
+One subtlety: after context compression (s06), the agent might forget who it is. Identity re-injection fixes this.
+
+---
+
+Idle cycle with task board polling, auto-claiming unclaimed tasks, and identity re-injection after context compression. Builds on s10's protocols.
+
+Key insight: "The agent finds work itself."
+
+```
+    Teammate lifecycle:
+    +-------+
+    | spawn |
+    +---+---+
+        |
+        v
+    +-------+  tool_use    +-------+
+    | WORK  | <----------- |  LLM  |
+    +---+---+              +-------+
+        |
+        | stop_reason != tool_use
+        v
+    +--------+
+    | IDLE   | poll every 5s for up to 60s
+    +---+----+
+        |
+        +---> check inbox -> message? -> resume WORK
+        |
+        +---> scan .tasks/ -> unclaimed? -> claim -> resume WORK
+        |
+        +---> timeout (60s) -> shutdown
+
+    Identity re-injection after compression:
+    messages = [identity_block, ...remaining...]
+    "You are 'coder', role: backend, team: my-team"
+```
+
+**Tools**
+
+21. Idle
+22. Clain Task
 
 ## Tests
 
@@ -442,6 +541,14 @@ Key insight: "Same request_id correlation pattern, two domains."
 3. Spawn bob with a risky refactoring task. Review and reject his plan.
 4. Spawn charlie, have him submit a plan, then approve it.
 5. Type `/team` to monitor statuses
+
+**s11**
+
+1. Create 3 tasks on the board, then spawn alice and bob. Watch them auto-claim.
+2. Spawn a coder teammate and let it find work from the task board itself
+3. Create tasks with dependencies. Watch teammates respect the blocked order.
+4. Type `/tasks` to see the task board with owners
+5. Type `/team` to monitor who is working vs idle
 
 ## Explorer: Design Decisions
 
@@ -721,3 +828,29 @@ Teammates check their inbox file at the top of every agent loop iteration, befor
 **Alternatives Considered**
 
 Checking inbox after each tool execution would be more responsive but adds overhead to every tool call, which is more frequent than LLM calls. A separate watcher thread could monitor the inbox continuously but adds threading complexity. Checking once per LLM call is the pragmatic sweet spot: responsive enough for coordination, cheap enough to not impact performance.
+
+**s11: Autonomous Agents**
+
+### Polling for Unclaimed Tasks Instead of Event-Driven Notification
+
+Autonomous teammates poll the shared task board every ~1 second to find unclaimed tasks, rather than waiting for event-driven notifications. Polling is fundamentally simpler than pub/sub: there's no subscription management, no event routing, no missed-event bugs. With file-based persistence, polling is just 'read the directory listing' -- a cheap operation that works regardless of how many agents are running. The 1-second interval balances responsiveness (new tasks are discovered quickly) against filesystem overhead (not hammering the disk with reads).
+
+**Alternatives Considered**
+
+Event-driven notification (file watchers via inotify/fsevents, or a pub/sub channel) would reduce latency from seconds to milliseconds. But file watchers are platform-specific and unreliable across network filesystems. A message broker would work but adds infrastructure. For a system where tasks take minutes to complete, discovering new tasks in 1 second instead of 10 milliseconds makes no practical difference.
+
+### 60-Second Idle Timeout Before Self-Termination
+
+When an autonomous teammate has no tasks to work on and no messages in its inbox, it waits up to 60 seconds before giving up and shutting down. This prevents zombie teammates that wait forever for work that never comes -- a real problem when the lead forgets to send a shutdown request, or when all remaining tasks are blocked on external events. The 60-second window is long enough that a brief gap between task completions and new task creation won't cause premature shutdown, but short enough that unused teammates don't waste resources.
+
+**Alternatives Considered**
+
+No timeout (wait forever) risks zombie processes. A very short timeout (5s) causes premature exits when the lead is simply thinking or typing. A heartbeat system (lead periodically pings teammates to keep them alive) works but adds protocol complexity. The 60-second fixed timeout is a good default that balances false-positive exits against resource waste.
+
+### Re-Inject Teammate Identity After Context Compression
+
+When auto_compact compresses the conversation, the resulting summary loses crucial metadata: the teammate's name, which team it belongs to, and its agent_id. Without this information, the teammate can't claim tasks (tasks are owned by name), can't check its inbox (inbox files are keyed by agent_id), and can't identify itself in messages. So after every auto_compact, the system re-injects a structured identity block into the conversation: `You are [name] on team [team], your agent_id is [id], your inbox is at [path].` This is the minimum context needed for the teammate to remain functional after memory loss.
+
+**Alternatives Considered**
+
+Putting identity in the system prompt (which survives compression) would avoid this problem, but violates the cache-friendly static-system-prompt design from s05. Embedding identity in the summary prompt ('when summarizing, always include your name and team') is unreliable -- the LLM might omit it. Explicit post-compression injection is deterministic and guaranteed to work.

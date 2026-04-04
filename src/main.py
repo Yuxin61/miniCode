@@ -28,6 +28,8 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 WORKDIR = Path.cwd()
+PROJECT_DIR = WORKDIR / ".miniCode"
+PROJECT_DIR.mkdir(parents=True, exist_ok=True)
 client = Anthropic(
     base_url=os.getenv("ANTHROPIC_BASE_URL"), 
     api_key=os.getenv("ANTHROPIC_AUTH_TOKEN")
@@ -40,6 +42,10 @@ KEEP_RECENT = 3
 TASKS_DIR = WORKDIR / ".minicode" / "tasks"
 TEAM_DIR = WORKDIR / ".minicode" / "team"
 INBOX_DIR = TEAM_DIR / "inbox"
+TAKS_CLAIM_DIR = TEAM_DIR / "tasks"
+
+POLL_INTERVAL = 5
+IDLE_TIMEOUT = 60
 
 VALID_MSG_TYPES = {
     "message",
@@ -53,6 +59,7 @@ VALID_MSG_TYPES = {
 shutdown_requests = {}
 plan_requests = {}
 _tracker_lock = threading.Lock()
+_claim_lock = threading.Lock()
 
 
 def estimate_tokens(messages: list) -> int:
@@ -188,6 +195,12 @@ class TeammateManager:
                 return m
         return None
     
+    def _set_status(self, name: str, status: str):
+        member = self._find_member(name)
+        if member:
+            member["status"] = status
+            self._save_config()
+    
     def spawn(self, name: str, role: str, prompt: str) -> str:
         member = self._find_member(name)
         if member:
@@ -200,7 +213,7 @@ class TeammateManager:
             self.config["members"].append(member)
         self._save_config()
         thread = threading.Thread(
-            target=self._teammate_loop,
+            target=self._loop,
             args=(name, role, prompt),
             daemon=True
         )
@@ -208,45 +221,94 @@ class TeammateManager:
         thread.start()
         return f"Spawned '{name}' (role: {role})"
     
-    def _teammate_loop(self, name: str, role: str, prompt: str):
+    def _loop(self, name: str, role: str, prompt: str):
+        team_name = self.config["team_name"]
         sys_prompt = dedent(f"""
-            You are '{name}', role: {role}, at {WORKDIR}.
+            You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}.
             Use send_message to communicate. Complete your task.
+            Use idle tool when you have no more work. You will auto-claim new tasks.
             Submit plans via plan_approval before major work.
             Respond to shutdown_request with shutdown_response.
         """)
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
-        should_exit = False
-        for _ in range(50):
-            inbox = BUS.read_inbox(name)
-            for msg in inbox:
-                messages.append({"role": "user", "content": json.dumps(msg, ensure_ascii=False)})
-            try:
-                response = client.messages.create(
-                    model=MODEL, system=sys_prompt, messages=messages,
-                    tools=tools, max_tokens=8000,
-                )
-            except Exception:
-                break
-            messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason != "tool_use":
-                break
-            results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    output = self._exec(name, block.name, block.input)
-                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                    results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(output),
-                    })
-            messages.append({"role": "user", "content": results})
-        member = self._find_member(name)
-        if member and member["status"] != "shutdown":
-            member["status"] = "idle"
-            self._save_config()
+        
+        while True:
+            # -- WORK PHASE: standard agent loop --
+            for i in range(50):
+                inbox = BUS.read_inbox(name)
+                for msg in inbox:
+                    if msg.get("type") == "shutdown_request":
+                        self._set_status(name, "shutdown")
+                        return
+                    messages.append({"role": "user", "content": json.dumps(msg, ensure_ascii=False)})
+                try:
+                    response = client.messages.create(
+                        model=MODEL, 
+                        system=sys_prompt, 
+                        messages=messages,
+                        tools=tools, 
+                        max_tokens=8000,
+                    )
+                except Exception:
+                    self._set_status(name, "idle")
+                    return
+                messages.append({"role": "assistant", "content": response.content})
+                if response.stop_reason != "tool_use":
+                    break
+                results = []
+                idle_requested = False
+                for block in response.content:
+                    if block.type == "tool_use":
+                        if block.name == "idle":
+                            idle_requested = True
+                            output = "Entering idle phase. Will poll for new tasks."
+                        else:
+                            output = self._exec(name, block.name, block.input)
+                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                        results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(output),
+                        })
+                messages.append({"role": "user", "content": results})
+                if idle_requested:
+                    break
+            
+            # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
+            self._set_status(name, "idle")
+            resume = False
+            polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
+            for _ in range(polls):
+                time.sleep(POLL_INTERVAL)
+                inbox = BUS.read_inbox(name)
+                if inbox:
+                    for msg in inbox:
+                        if msg.get("type") == "shutdown_request":
+                            self._set_status(name, "shutdown")
+                            return
+                        messages.append({"role": "user", "content": json.dumps(msg)})
+                    resume = True
+                    break
+                unclaimed = scan_unclaimed_tasks()
+                if unclaimed:
+                    task = unclaimed[0]
+                    claim_task(task["id"], name)
+                    task_prompt = dedent(f"""
+                        <auto-claimed>Task #{task['id']}: {task['subject']}
+                        {task.get('description', '')}</auto-claimed>
+                    """)
+                    if len(messages) <= 3:
+                        messages.insert(0, make_identity_block(name, role, team_name))
+                        messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
+                    messages.append({"role": "user", "content": task_prompt})
+                    messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
+                    resume = True
+                    break
+            if not resume:
+                self._set_status(name, "shutdown")
+                return
+            self._set_status(name, "working")
     
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         if tool_name == "bash":
@@ -282,6 +344,8 @@ class TeammateManager:
                 {"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
+        if tool_name == "claim_task":
+            return claim_task(args["task_id"], sender)
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -302,6 +366,10 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
             {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
              "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
+            {"name": "idle", "description": "Signal that you have no more work. Enters idle polling phase.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "claim_task", "description": "Claim a task from the task board by ID.",
+             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
         ]
 
     def list_all(self) -> str:
@@ -546,6 +614,39 @@ class TodoManager:
         return "\n".join(lines)
 
 
+# -- Task board scanning --
+def scan_unclaimed_tasks() -> list:
+    TAKS_CLAIM_DIR.mkdir(exist_ok=True)
+    unclaimed = []
+    for f in sorted(TAKS_CLAIM_DIR.glob("task_*.json")):
+        task = json.loads(f.read_text())
+        if (task.get("status") == "pending"
+            and not task.get("owner")
+            and not task.get("blockedBy")):
+            unclaimed.append(task)
+    return unclaimed
+
+
+def claim_task(task_id: int, owner: str) -> str:
+    with _claim_lock:
+        path = TAKS_CLAIM_DIR / f"task_{task_id}.json"
+        if not path.exists():
+            return f"Error: Task {task_id} not found."
+        task = json.loads(path.read_text())
+        task["owner"] = owner
+        task["status"] = "in_progress"
+        path.write_text(json.dumps(task, indent=2))
+    return f"Claimed task #{task_id} for {owner}."
+
+
+# -- Identity re-injection after compression --
+def make_identity_block(name: str, role: str, team_name: str) -> dict:
+    return {
+        "role": "user",
+        "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
+    }
+
+
 TEAM = TeammateManager(TEAM_DIR)
 BUS = MessageBus(INBOX_DIR)
 BG = BackgroundManager()
@@ -563,6 +664,7 @@ SYSTEM = dedent(f"""
 
     You can also take on the role of a team leader, spawn teammates, and communicate with them via inboxes.
     Manage teammates with shutdown and plan approval protocols.
+    Teammates are autonomous -- they find work themselves.
 
     Skills available:
     {SKILL_LOADER.get_descriptions()}
@@ -690,6 +792,8 @@ TOOL_HANDLERS = {
     "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
     "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
     "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
+    "idle":              lambda **kw: "Lead does not idle.",
+    "claim_task":        lambda **kw: claim_task(kw["task_id"], "lead"),
 }
 
 
@@ -824,6 +928,17 @@ PARENT_TOOLS = CHILD_TOOLS + [
          "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, 
          "required": ["request_id", "approve"]
     }},
+    {"name": "idle", "description": "Enter idle state (for lead -- rarely used).",
+     "input_schema": {
+         "type": "object", 
+         "properties": {}
+    }},
+    {"name": "claim_task", "description": "Claim a task from the board by ID.",
+     "input_schema": {
+         "type": "object", 
+         "properties": {"task_id": {"type": "integer"}}, 
+         "required": ["task_id"]
+    }},
 ]
 
 
@@ -881,8 +996,11 @@ def agent_loop(messages: list):
             messages.append({"role": "assistant", "content": "Noted background results."})
         
         response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=PARENT_TOOLS, max_tokens=8000,
+            model=MODEL, 
+            system=SYSTEM, 
+            messages=messages,
+            tools=PARENT_TOOLS, 
+            max_tokens=8000,
         )
         # Append assistant turn
         messages.append({"role": "assistant", "content": safe_content(response.content)})
@@ -940,6 +1058,14 @@ if __name__ == "__main__":
             continue
         if query.strip() == "/inbox":
             print(json.dumps(BUS.read_inbox("lead"), indent=2, ensure_ascii=False))
+            continue
+        if query.strip() == "/tasks":
+            TAKS_CLAIM_DIR.mkdir(exist_ok=True)
+            for f in sorted(TAKS_CLAIM_DIR.glob("task_*.json")):
+                t = json.loads(f.read_text())
+                marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
+                owner = f"@{t['owner']}" if t.get("owner") else ""
+                print(f"  {marker} #{t['id']}: {t['subject']} {owner}")
             continue
         history.append({"role": "user", "content": safe_content(query)})
         try:
