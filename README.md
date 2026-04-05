@@ -8,11 +8,11 @@ This project is an implementation of https://learn.shareai.run/.
 -------------------------------------------------------------------------------
 Language                     files          blank        comment           code
 -------------------------------------------------------------------------------
-Python                           1            103             74            904
-Markdown                         1            292              0            564
+Python                           1            131             81           1311
+Markdown                         1            333              0            661
 TOML                             1              0              0             10
 -------------------------------------------------------------------------------
-SUM:                             3            395             74           1478
+SUM:                             3            464             81           1982
 -------------------------------------------------------------------------------
 ```
 
@@ -25,6 +25,21 @@ MODEL_ID=
 ```
 
 ## Stages
+
+**Path**
+
+- (Tools & Execution) s01: The Agent Loop
+- (Tools & Execution) s02: Tools
+- (Planning & Coordination) s03: Todo
+- (Planning & Coordination) s04: Subagents
+- (Planning & Coordination) s05: Skills
+- (Memory Management) s06: Compact
+- (Planning & Coordination) s07: Tasks
+- (Concueerncy) s08: Background Tasks
+- (Collaboration) s09: Agent Teams
+- (Collaboration) s10: Team Protocols
+- (Collaboration) s11: Autonomous Agents
+- (Collaboration) s12: Worktree + Task Isolation
 
 ### s01. The Agent Loop
 
@@ -472,6 +487,71 @@ Key insight: "The agent finds work itself."
 21. Idle
 22. Clain Task
 
+### s12: Worktree + Task Isolation
+
+By s11, agents can claim and complete tasks autonomously. But every task runs in one shared directory. Two agents refactoring different modules at the same time will collide: agent A edits `config.py`, agent B edits `config.py`, unstaged changes mix, and neither can roll back cleanly.
+
+The task board tracks what to do but has no opinion about where to do it. The fix: give each task its own git worktree directory. Tasks manage goals, worktrees manage execution context. Bind them by task ID.
+
+---
+
+Directory-level isolation for parallel task execution. Tasks are the control plane and worktrees are the execution plane.
+
+Key insight: "Isolate by directory, coordinate by task ID."
+
+```json
+    .tasks/task_12.json
+      {
+        "id": 12,
+        "subject": "Implement auth refactor",
+        "status": "in_progress",
+        "worktree": "auth-refactor"
+      }
+    .worktrees/index.json
+      {
+        "worktrees": [
+          {
+            "name": "auth-refactor",
+            "path": ".../.worktrees/auth-refactor",
+            "branch": "wt/auth-refactor",
+            "task_id": 12,
+            "status": "active"
+          }
+        ]
+      }
+```
+
+```
+    Control plane (.tasks/)                        Execution plane (.worktrees/)
+    +-----------------------------+                +----------------------------+
+    | task_1.json                 |                | auth-refactor/             |
+    |   status: in_progress       |    <------>    |   branch: wt/auth-refactor |
+    |   worktree: "auth-refactor" |                |   task_id: 1               |
+    +-----------------------------+                +----------------------------+
+    | task_2.json                 |                | ui-login/                  |
+    |   status: pending           |    <------>    |   branch: wt/ui-login      |
+    |   worktree: "ui-login"      |                |   task_id: 2               |
+    +-----------------------------+                +----------------------------+
+    
+    index.json   (worktree registry)
+    events.jsonl (lifecycle log)
+
+    State machines:
+    Task:     pending -> in_progress -> completed
+    Worktree: absent  -> active      -> removed | kept
+```
+
+**Tools**
+
+23. Task Bind Worktree
+24. Worktree Create
+25. Worktree List
+26. Worktree Status
+27. Worktree Run
+28. Worktree Keep
+29. Worktree Remove
+30. Worktree Events
+
 ## Tests
 
 **s01**
@@ -549,6 +629,14 @@ Key insight: "The agent finds work itself."
 3. Create tasks with dependencies. Watch teammates respect the blocked order.
 4. Type `/tasks` to see the task board with owners
 5. Type `/team` to monitor who is working vs idle
+
+**s12**
+
+1. Create tasks for backend auth and frontend login page, then list tasks.
+2. Create worktree "auth-refactor" for task 1, then bind task 2 to a new worktree "ui-login".
+3. Run "git status --short" in worktree "auth-refactor".
+4. Keep worktree "ui-login", then list worktrees and inspect events.
+5. Remove worktree "auth-refactor" with complete_task=true, then list tasks/worktrees/events.
 
 ## Explorer: Design Decisions
 
@@ -854,3 +942,53 @@ When auto_compact compresses the conversation, the resulting summary loses cruci
 **Alternatives Considered**
 
 Putting identity in the system prompt (which survives compression) would avoid this problem, but violates the cache-friendly static-system-prompt design from s05. Embedding identity in the summary prompt ('when summarizing, always include your name and team') is unreliable -- the LLM might omit it. Explicit post-compression injection is deterministic and guaranteed to work.
+
+**s12: Worktree + Task Isolation**
+
+### Shared Task Board + Isolated Execution Lanes
+
+The task board remains shared and centralized in `.tasks/`, while file edits happen in per-task worktree directories. This separation preserves global visibility (who owns what, what is done) without forcing everyone to edit inside one mutable directory. Coordination stays simple because there is one board, and execution stays safe because each lane is isolated.
+
+**Alternatives Considered**
+
+A single shared workspace is simpler but causes edit collisions and mixed git state. Fully independent task stores per lane avoid collisions but lose team-level visibility and make planning harder.
+
+### Explicit Worktree Lifecycle Index
+
+`.worktrees/index.json` records each worktree's name, path, branch, task_id, and status. This makes lifecycle state inspectable and recoverable even after context compression or process restarts. The index also provides a deterministic source for list/status/remove operations.
+
+**Alternatives Considered**
+
+Relying only on `git worktree list` removes local bookkeeping but loses task binding metadata and custom lifecycle states. Keeping all state only in memory is simpler in code but breaks recoverability.
+
+### Lane-Scoped CWD Routing + Re-entry Guard
+
+Commands are routed to a worktree's directory via `worktree_run(name, command)` using the `cwd` parameter. A re-entry guard prevents accidentally running inside an already-active worktree context, keeping lifecycle ownership unambiguous.
+
+**Alternatives Considered**
+
+Global cwd mutation is easy to implement but can leak context across parallel work. Allowing silent re-entry makes lifecycle ownership ambiguous and complicates teardown behavior.
+
+### Append-Only Lifecycle Event Stream
+
+Lifecycle events are appended to `.worktrees/events.jsonl` (`worktree.create.*`, `worktree.remove.*`, `task.completed`). This turns hidden transitions into queryable records and makes failures explicit (`*.failed`) instead of silent.
+
+**Alternatives Considered**
+
+Relying only on console logs is lighter but fragile during long sessions and hard to audit. A full event bus infrastructure is powerful but heavier than needed for this teaching baseline.
+
+### Close Task and Workspace Together
+
+`worktree_remove(..., complete_task=true)` allows a single closeout step: remove the isolated directory and mark the bound task completed. Closeout remains an explicit tool-driven transition (`worktree_keep` / `worktree_remove`) rather than hidden automatic cleanup. This reduces dangling state where a task says done but its temporary lane remains active (or the reverse).
+
+**Alternatives Considered**
+
+Keeping closeout fully manual gives flexibility but increases operational drift. Fully automatic removal on every completion risks deleting a workspace before final review.
+
+### Event Stream Is Observability Side-Channel
+
+Lifecycle events improve auditability, but the source of truth remains task/worktree state files. Events should be read as transition traces, not as a replacement state machine.
+
+**Alternatives Considered**
+
+Using logs alone hides structured transitions; using events as the only state source risks drift when replay/repair semantics are undefined.
