@@ -92,11 +92,11 @@ Key insight: "The loop didn't change at all. I just added tools."
     |   User   | ---> |  LLM  | ---> | Tool Dispatch    |
     |  prompt  |      |       |      | {                |
     +----------+      +---+---+      |   bash: run_bash |
-                        ^          |   read: run_read |
-                        |          |   write: run_wr  |
-                        +----------+   edit: run_edit |
-                        tool_result| }                |
-                                    +------------------+
+                        ^            |   read: run_read |
+                        |            |   write: run_wr  |
+                        +------------+   edit: run_edit |
+                        tool_result  | }                |
+                                     +------------------+
 ```
 
 **Tools**
